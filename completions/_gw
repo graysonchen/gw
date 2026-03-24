@@ -1,0 +1,59 @@
+#compdef gw
+
+_gw() {
+  local -a commands
+  commands=(
+    'init:Initialize gw for current project'
+    'add:Create worktree + auto-link'
+    'rm:Remove a worktree'
+    'list:List all worktrees'
+    'cd:Jump to a worktree'
+    'link:Re-run symlinks for a worktree'
+    'config:Show or edit config'
+    'prune:Clean up stale worktree refs'
+    'help:Show help'
+    'version:Show version'
+  )
+
+  local -a config_subcmds
+  config_subcmds=(
+    'show:Show current config'
+    'edit:Edit config file'
+    'edit-links:Edit links file'
+  )
+
+  _arguments -C \
+    '1:command:->cmd' \
+    '*::arg:->args'
+
+  case "$state" in
+    cmd)
+      _describe -t commands 'gw command' commands
+      ;;
+    args)
+      case "${words[1]}" in
+        add|a)
+          # Complete git branches
+          local -a branches
+          branches=(${(f)"$(git branch -a --format='%(refname:short)' 2>/dev/null)"})
+          _describe -t branches 'branch' branches
+          ;;
+        rm|remove|cd|link)
+          # Complete existing worktree names
+          local wt_base
+          wt_base="$(gw config show 2>/dev/null | grep 'Worktree base:' | awk '{print $NF}')"
+          if [[ -n "$wt_base" && -d "$wt_base" ]]; then
+            local -a worktrees
+            worktrees=(${(f)"$(ls -1 "$wt_base" 2>/dev/null)"})
+            _describe -t worktrees 'worktree' worktrees
+          fi
+          ;;
+        config|cfg)
+          _describe -t config_subcmds 'config subcommand' config_subcmds
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_gw "$@"

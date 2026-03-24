@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+#
+# gw — Git Worktree Manager
+#
+# A lightweight CLI that wraps `git worktree` with automatic
+# config/dependency linking for large projects.
+#
+# Usage: gw <command> [args]
+#
+set -euo pipefail
+
+GW_VERSION="0.1.0"
+GW_DIR=".gw"
+GW_CONFIG="${GW_DIR}/config"
+GW_LINKS="${GW_DIR}/links"
+
+# ═══════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════
+
+die()  { echo "gw: error: $*" >&2; exit 1; }
+info() { echo "  $*"; }
+ok()   { echo "✅ $*"; }
+
+# Find the git repo root (the main worktree)
+find_main_repo() {
+  local dir
+  dir="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not a git repository"
+
+  # If we're in a worktree, follow .git file to the real repo
+  if [[ -f "${dir}/.git" ]]; then
+    local git_dir
+    git_dir="$(cat "${dir}/.git" | sed 's/^gitdir: //')"
+    # .git file points to e.g. /path/to/main/.git/worktrees/xxx
+    dir="$(cd "${dir}/${git_dir}/../../.." && pwd)"
+  fi
+  echo "$dir"
+}
+
+# Load project config, returns success/failure
+load_config() {
+  MAIN_REPO="$(find_main_repo)"
+  local cfg="${MAIN_REPO}/${GW_CONFIG}"
+
+  if [[ ! -f "$cfg" ]]; then
+    return 1
+  fi
+
+  # Parse config
+  WORKTREE_BASE=""
+  while IFS='=' read -r key value; do
+    [[ -z "$key" || "$key" == \#* ]] && continue
+    key="$(echo "$key" | xargs)"
+    value="$(echo "$value" | xargs)"
+    case "$key" in
+      worktree_base) WORKTREE_BASE="$value" ;;
+    esac
+  done < "$cfg"
+
+  # Resolve relative path
+  if [[ -n "$WORKTREE_BASE" && "$WORKTREE_BASE" != /* ]]; then
+    WORKTREE_BASE="$(cd "$MAIN_REPO" && cd "$WORKTREE_BASE" 2>/dev/null && pwd)" || \
+    WORKTREE_BASE="$(cd "$MAIN_REPO" && mkdir -p "$WORKTREE_BASE" && cd "$WORKTREE_BASE" && pwd)"
+  fi
+
+  [[ -z "$WORKTREE_BASE" ]] && die "worktree_base not set in ${cfg}"
+  return 0
+}
+
+require_config() {
+  load_config || die "not initialized. Run 'gw init' first."
+}
+
+# Symlink a single item from main repo to target worktree
+link_item() {
+  local rel_path="$1"
+  local src="${MAIN_REPO}/${rel_path}"
+  local dst="${TARGET}/${rel_path}"
+
+  if [[ ! -e "$src" ]]; then
+    info "SKIP (missing) : $rel_path"
+    return
+  fi
+
+  if [[ -L "$dst" ]]; then
+    local existing
+    existing="$(readlink "$dst")"
+    if [[ "$existing" == "$src" ]]; then
+      info "OK   (linked)  : $rel_path"
+      return
+    fi
+    rm "$dst"
+  elif [[ -e "$dst" ]]; then
+    mv "$dst" "${dst}.bak"
+    info "BACK (.bak)    : $rel_path"
+  fi
+
+  mkdir -p "$(dirname "$dst")"
+  ln -s "$src" "$dst"
+  info "LINK           : $rel_path"
+}
+
+# Run all symlinks for a target directory
+run_links() {
+  TARGET="$1"
+  local links_file="${MAIN_REPO}/${GW_LINKS}"
+
+  if [[ ! -f "$links_file" ]]; then
+    info "(no links file found, skipping symlinks)"
+    return
+  fi
+
+  echo ""
+  echo "🔗 Linking config & dependencies..."
+  echo "   from: $MAIN_REPO"
+  echo "   to:   $TARGET"
+  echo ""
+
+  while IFS= read -r line; do
+    # Skip empty lines and comments
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    line="$(echo "$line" | xargs)"  # trim whitespace
+    [[ -z "$line" ]] && continue
+    link_item "$line"
+  done < "$links_file"
+}
+
+# Extract short name from branch: feature/OA-12345 → OA-12345
+branch_to_name() {
+  echo "${1##*/}"
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Commands
+# ═══════════════════════════════════════════════════════════════════════
+
+cmd_init() {
+  local repo_root
+  repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not a git repository"
+
+  local project_name
+  project_name="$(basename "$repo_root")"
+
+  local gw_dir="${repo_root}/${GW_DIR}"
+
+  if [[ -f "${gw_dir}/config" ]]; then
+    echo "gw is already initialized in this project."
+    echo "Config: ${gw_dir}/config"
+    echo ""
+    echo "Run 'gw config edit' to modify settings."
+    return 0
+  fi
+
+  mkdir -p "$gw_dir"
+
+  # Default worktree base: sibling directory
+  local default_base="../${project_name}-worktree"
+
+  echo "Initializing gw for: $repo_root"
+  echo ""
+
+  # Ask for worktree base
+  read -rp "Worktree base directory [${default_base}]: " user_base
+  local wt_base="${user_base:-$default_base}"
+
+  # Create config
+  cat > "${gw_dir}/config" <<EOF
+# gw config — Git Worktree Manager
+# Project: ${project_name}
+
+# Base directory for worktrees (relative to repo root)
+worktree_base=${wt_base}
+EOF
+
+  # Create links file with common defaults
+  cat > "${gw_dir}/links" <<EOF
+# gw links — Files & directories to symlink into worktrees
+#
+# Each line is a path relative to the repo root.
+# Lines starting with # are comments.
+# These are typically gitignored files that worktrees need.
+
+# Bundler
+.bundle/config
+
+# Config files (gitignored / local-only)
+# config/database.yml
+# config/master.key
+
+# Dependencies (shared to save disk space)
+# vendor/bundle
+# node_modules
+
+# Cache
+# tmp/cache
+EOF
+
+  # Create the worktree base directory
+  local abs_base
+  abs_base="$(cd "$repo_root" && mkdir -p "$wt_base" && cd "$wt_base" && pwd)"
+
+  # Add .gw to .gitignore if not already there
+  local gitignore="${repo_root}/.gitignore"
+  if [[ -f "$gitignore" ]]; then
+    if ! grep -qxF '.gw/' "$gitignore" 2>/dev/null; then
+      echo "" >> "$gitignore"
+      echo "# gw - Git Worktree Manager" >> "$gitignore"
+      echo ".gw/" >> "$gitignore"
+      info "Added .gw/ to .gitignore"
+    fi
+  fi
+
+  echo ""
+  ok "Initialized!"
+  echo ""
+  echo "   Config:  ${gw_dir}/config"
+  echo "   Links:   ${gw_dir}/links"
+  echo "   Base:    ${abs_base}"
+  echo ""
+  echo "Next steps:"
+  echo "   1. Edit links file:  gw config edit-links"
+  echo "   2. Create worktree:  gw add <branch>"
+}
+
+cmd_add() {
+  local branch="${1:-}"
+  [[ -z "$branch" ]] && die "usage: gw add <branch>"
+
+  require_config
+
+  local name
+  name="$(branch_to_name "$branch")"
+  local dir="${WORKTREE_BASE}/${name}"
+
+  echo "📂 Creating worktree..."
+  echo "   Branch: $branch"
+  echo "   Dir:    $dir"
+
+  cd "$MAIN_REPO"
+
+  # Try existing branch first, then create new
+  if ! git worktree add "$dir" "$branch" 2>/dev/null; then
+    echo "   Branch '$branch' not found locally, creating new branch..."
+    git worktree add -b "$branch" "$dir" || die "failed to create worktree"
+  fi
+
+  # Auto-link
+  run_links "$dir"
+
+  echo ""
+  echo "═══════════════════════════════════════════════"
+  ok "Ready!"
+  echo "   Dir:    $dir"
+  echo "   Branch: $branch"
+  echo ""
+  echo "   cd $dir"
+  echo "═══════════════════════════════════════════════"
+}
+
+cmd_rm() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && die "usage: gw rm <name>"
+
+  require_config
+
+  local dir="${WORKTREE_BASE}/${name}"
+
+  if [[ ! -d "$dir" ]]; then
+    die "worktree not found: $dir"
+  fi
+
+  # If cwd is inside the worktree, warn
+  if [[ "$(pwd)" == "${dir}"* ]]; then
+    echo "⚠️  You are inside this worktree. cd out first."
+    echo "   cd $MAIN_REPO"
+    return 1
+  fi
+
+  git -C "$MAIN_REPO" worktree remove "$dir" --force
+  ok "Removed: $name ($dir)"
+}
+
+cmd_list() {
+  require_config
+  echo "📋 Worktrees for: $(basename "$MAIN_REPO")"
+  echo ""
+  git -C "$MAIN_REPO" worktree list
+}
+
+cmd_cd() {
+  require_config
+
+  local name="${1:-}"
+
+  if [[ -z "$name" ]]; then
+    # No arg: use fzf if available, else list
+    if command -v fzf &>/dev/null; then
+      local selected
+      selected=$(git -C "$MAIN_REPO" worktree list | \
+        fzf --prompt="🌲 worktree> " --height=40% | \
+        awk '{print $1}')
+      if [[ -n "$selected" ]]; then
+        echo "$selected"
+      fi
+    else
+      echo "Usage: gw cd <name>"
+      echo ""
+      echo "Available:"
+      ls -1 "$WORKTREE_BASE" 2>/dev/null | grep -v '\.sh$' || echo "  (none)"
+    fi
+    return
+  fi
+
+  local dir="${WORKTREE_BASE}/${name}"
+  [[ ! -d "$dir" ]] && die "worktree not found: $dir"
+  echo "$dir"
+}
+
+cmd_link() {
+  require_config
+
+  local name="${1:-}"
+  local dir
+
+  if [[ -z "$name" ]]; then
+    # Default to current directory
+    dir="$(pwd)"
+    [[ "$dir" == "$MAIN_REPO" ]] && die "cannot link main repo to itself"
+  else
+    dir="${WORKTREE_BASE}/${name}"
+  fi
+
+  [[ ! -d "$dir" ]] && die "directory not found: $dir"
+
+  run_links "$dir"
+  echo ""
+  ok "Links updated for: $dir"
+}
+
+cmd_config() {
+  local subcmd="${1:-show}"
+
+  case "$subcmd" in
+    show)
+      require_config
+      echo "📋 gw config for: $(basename "$MAIN_REPO")"
+      echo "   Main repo:      $MAIN_REPO"
+      echo "   Worktree base:  $WORKTREE_BASE"
+      echo ""
+      echo "── ${MAIN_REPO}/${GW_CONFIG} ──"
+      cat "${MAIN_REPO}/${GW_CONFIG}"
+      echo ""
+      echo "── ${MAIN_REPO}/${GW_LINKS} ──"
+      cat "${MAIN_REPO}/${GW_LINKS}"
+      ;;
+    edit)
+      require_config
+      ${EDITOR:-vi} "${MAIN_REPO}/${GW_CONFIG}"
+      ;;
+    edit-links)
+      require_config
+      ${EDITOR:-vi} "${MAIN_REPO}/${GW_LINKS}"
+      ;;
+    *)
+      die "unknown config subcommand: $subcmd (use: show, edit, edit-links)"
+      ;;
+  esac
+}
+
+cmd_prune() {
+  require_config
+  echo "🧹 Pruning stale worktrees..."
+  git -C "$MAIN_REPO" worktree prune -v
+  ok "Done"
+}
+
+cmd_help() {
+  cat <<'EOF'
+gw — Git Worktree Manager
+
+Usage: gw <command> [args]
+
+Commands:
+  init                  Initialize gw for current project
+  add <branch>          Create worktree + auto-link config/deps
+  rm <name>             Remove a worktree
+  list                  List all worktrees
+  cd <name>             Print worktree path (use with: cd $(gw cd xxx))
+  link [name]           Re-run symlinks for a worktree
+  config show           Show current config & links
+  config edit           Edit config file in $EDITOR
+  config edit-links     Edit links file in $EDITOR
+  prune                 Clean up stale worktree references
+  help                  Show this help
+  version               Show version
+
+Examples:
+  gw init                           # Set up gw for your project
+  gw add feature/OA-12345           # Create worktree + link
+  cd $(gw cd OA-12345)              # Jump to worktree
+  gw link OA-12345                  # Re-link after config changes
+  gw rm OA-12345                    # Clean up
+
+Config files (in .gw/):
+  config       Project settings (worktree_base path)
+  links        Files & dirs to symlink into worktrees
+
+EOF
+}
+
+cmd_version() {
+  echo "gw ${GW_VERSION}"
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+# Main dispatcher
+# ═══════════════════════════════════════════════════════════════════════
+
+main() {
+  local cmd="${1:-help}"
+  shift 2>/dev/null || true
+
+  case "$cmd" in
+    init)         cmd_init "$@" ;;
+    add|a)        cmd_add "$@" ;;
+    rm|remove)    cmd_rm "$@" ;;
+    list|ls|l)    cmd_list "$@" ;;
+    cd)           cmd_cd "$@" ;;
+    link)         cmd_link "$@" ;;
+    config|cfg)   cmd_config "$@" ;;
+    prune)        cmd_prune "$@" ;;
+    help|--help|-h) cmd_help ;;
+    version|--version|-v) cmd_version ;;
+    *)            die "unknown command: $cmd (run 'gw help')" ;;
+  esac
+}
+
+main "$@"
