@@ -5,6 +5,12 @@ A lightweight CLI that wraps `git worktree` with automatic config/dependency lin
 ## Install
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/graysonchen/gw/main/install.sh | bash
+```
+
+Or manually:
+
+```bash
 git clone https://github.com/graysonchen/gw.git ~/.gw
 echo 'source ~/.gw/gw.sh' >> ~/.zshrc
 source ~/.zshrc
