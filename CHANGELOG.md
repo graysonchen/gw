@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2026-03-24
+
+### Added
+- `install.sh` — one-line install script, supports `curl | bash` quick installation.
+- Updated README with one-line install command.
+
 ## [0.1.1] - 2026-03-24
 
 ### Added
