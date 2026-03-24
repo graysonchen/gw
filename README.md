@@ -6,8 +6,7 @@ A lightweight CLI that wraps `git worktree` with automatic config/dependency lin
 
 ```bash
 git clone https://github.com/graysonchen/gw.git ~/.gw
-echo 'export PATH="$HOME/.gw/bin:$PATH"' >> ~/.zshrc
-echo 'source ~/.gw/completions/gw.zsh' >> ~/.zshrc
+echo 'source ~/.gw/gw.sh' >> ~/.zshrc
 source ~/.zshrc
 ```
 
